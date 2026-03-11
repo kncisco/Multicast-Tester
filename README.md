@@ -49,28 +49,7 @@ On Windows, `curses` is not part of the standard library. Without it the
 script works correctly but uses plain scrolling output instead of the
 persistent banner UI.
 
-To enable the full terminal UI on Windows, install the optional dependency:
-
-```bash
-pip install -r requirements.txt
-```
-
-The `requirements.txt` uses a platform marker so this is safe to run on
-Linux and macOS too — nothing will be installed on those platforms.
-
-```text
-# requirements.txt
-windows-curses; sys_platform == "win32"
-```
-
-| Platform | curses source | Install needed |
-|---|---|---|
-| Linux | stdlib | No |
-| macOS | stdlib | No |
-| Windows + pip install | `windows-curses` wheel | Yes, one command |
-| Windows without install | plain fallback | No — works as-is |
-
----
+We'll tackle Windows Curses support in a later release.
 
 ## Quick Start
 
