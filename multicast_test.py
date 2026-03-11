@@ -21,7 +21,24 @@ import socket
 import struct
 import sys
 import time
+from typing import TYPE_CHECKING
 import uuid
+
+# ─────────────────────────────────────────────────────────────────────────────
+# curses availability (stdlib on Linux/macOS; absent on Windows by default)
+# ─────────────────────────────────────────────────────────────────────────────
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # VS Code will "see" this and stop reporting errors
+    import curses
+    HAS_CURSES = True
+else:
+    try:
+        import curses
+        HAS_CURSES = True
+    except ImportError:
+        HAS_CURSES = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Protocol
@@ -29,7 +46,6 @@ import uuid
 
 MAGIC   = "MCAST"
 VERSION = 1
-
 
 def build_payload(seq: int, sid: str, src_ip: str, msg: str) -> bytes:
     return json.dumps({
@@ -58,6 +74,8 @@ def get_iface_ip(iface: str) -> str:
     Return the IPv4 address of *iface* on Linux, macOS, or Windows.
     Falls back to '' (INADDR_ANY) if it cannot be determined.
     """
+    iface = iface.split("@")[0]
+
     os_name = platform.system()
 
     # ── Linux: ioctl SIOCGIFADDR ──────────────────────────────────────────────
@@ -151,12 +169,12 @@ def enumerate_interfaces() -> list:
             )
             current_iface = None
             for line in out.splitlines():
-                # "1: lo: <LOOPBACK,UP,...>"
                 if line and line[0].isdigit():
                     parts = line.split(":")
                     if len(parts) >= 2:
-                        current_iface = parts[1].strip()
-                # "    inet 127.0.0.1/8 scope host lo"
+                        # Strip @parent suffix present on tunnel/virtual interfaces
+                        # e.g. 'gre0@NONE' -> 'gre0', 'gre1@eth0' -> 'gre1'
+                        current_iface = parts[1].strip().split("@")[0]
                 elif "inet " in line and current_iface:
                     tokens = line.split()
                     if len(tokens) >= 2:
@@ -165,7 +183,11 @@ def enumerate_interfaces() -> list:
                         try:
                             ipaddress.IPv4Address(ip)
                             is_lo = ipaddress.IPv4Address(ip).is_loopback
-                            ifaces.append({"iface": current_iface, "ip": ip, "is_lo": is_lo})
+                            ifaces.append({
+                                "iface": current_iface,
+                                "ip":    ip,
+                                "is_lo": is_lo,
+                            })
                         except ValueError:
                             pass
         except Exception:
@@ -325,14 +347,89 @@ def mcast_info(group: str) -> dict:
 
     return {"scope": scope, "type": grp_type, "mac": mac}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared banner formatter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def format_banner_lines(mode: str, args, local_ip: str, gi: dict,
+                        sid: str = "") -> list:
+    """
+    Return a list of plain strings that form the banner for either mode.
+    Each string is one line; no newline characters are included.
+    The caller is responsible for rendering them (print or curses.addstr).
+
+    Parameters
+    ----------
+    mode      : 'source' or 'receiver'
+    args      : parsed argparse namespace
+    local_ip  : resolved interface IP (or 'ANY')
+    gi        : dict returned by mcast_info()
+    sid       : session UUID (source mode only; pass '' for receiver)
+    """
+    sid_str = f"  id={sid[:8]}..." if sid else ""
+    lines = []
+
+    if mode == "source":
+        lines += [
+            "  SOURCE",
+            f"  iface  : {args.interface} ({local_ip}){sid_str}",
+            f"  group  : {args.group}:{args.port}"
+            f"  ttl={args.ttl}  every {args.interval}s",
+            f"  scope  : {gi['scope']}",
+            f"  type   : {gi['type']}",
+            f"  L2 MAC : {gi['mac']}",
+            f"  msg    : '{args.message}'",
+        ]
+    else:  # receiver
+        lines += [
+            "  RECEIVER",
+            f"  iface  : {args.interface} ({local_ip or 'ANY'})",
+            f"  group  : {args.group}:{args.port}",
+            f"  scope  : {gi['scope']}",
+            f"  type   : {gi['type']}",
+            f"  L2 MAC : {gi['mac']}",
+        ]
+
+    return lines
+
+
+BANNER_CONTENT_HEIGHT = 7   # number of content lines returned above
+BANNER_TOTAL_HEIGHT   = BANNER_CONTENT_HEIGHT + 4
+# breakdown: 1 top border  +  BANNER_CONTENT_HEIGHT  +  1 divider
+#            + 1 column-header line  +  1 column-divider  =  +4
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source
+# Post-exit reprint
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _reprint_log(log: list, mode: str, args, local_ip: str,
+                 gi: dict, sid: str = "") -> None:
+    """
+    After curses tears down, reprint the banner and every scroll-window
+    line to stdout so the output persists in the terminal scrollback.
+    """
+    W = 68
+    print("=" * W)
+    for line in format_banner_lines(mode, args, local_ip, gi, sid):
+        print(line)
+    print("-" * W)
+
+    if mode == "source":
+        print(f"  {'SEQ':>6}  {'TIMESTAMP':>19}  {'BYTES':>5}")
+    else:
+        print(f"  {'#RX':>5}  {'SOURCE':>15}  {'ID':>8}"
+              f"  {'SEQ':>6}  {'LAT(ms)':>8}  STATUS")
+    print("-" * W)
+
+    for line in log:
+        print(line)
+
+    print("=" * W)
 
 def run_source(args):
     sid      = str(uuid.uuid4())
     local_ip = get_iface_ip(args.interface) or "0.0.0.0"
+    gi       = mcast_info(args.group)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, args.ttl)
@@ -340,23 +437,106 @@ def run_source(args):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                         socket.inet_aton(local_ip))
 
-    gi = mcast_info(args.group)
-    W  = 62
+    if HAS_CURSES:
+        log = []
+        curses.wrapper(_run_source_curses, args, sock, local_ip, gi, sid, log)
+        _reprint_log(log, "source", args, local_ip, gi, sid)
+    else:
+        _run_source_plain(args, sock, local_ip, gi, sid)
+
+    sock.close()
+
+def _run_source_curses(stdscr, args, sock, local_ip, gi, sid, log):
+    """curses-based source loop with persistent banner."""
+    curses.curs_set(0)
+    stdscr.keypad(False)
+
+    running = True
+
+    def _stop(s, f):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT,  _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    def _log(line: str):
+        """Write to scroll window and append to the reprint buffer."""
+        log.append(line)
+        try:
+            scroll_win.addstr(line + "\n")
+            scroll_win.refresh()
+        except curses.error:
+            pass
+
+    def _draw_banner(banner_win, width):
+        banner_win.erase()
+        W = width - 1
+        banner_win.addstr(0, 0, ("=" * W)[:W])
+        content = format_banner_lines("source", args, local_ip, gi, sid)
+        for row, text in enumerate(content, start=1):
+            banner_win.addstr(row, 0, text[:W])
+        divider_row = BANNER_CONTENT_HEIGHT + 1
+        banner_win.addstr(divider_row, 0, ("-" * W)[:W])
+        hdr_row = divider_row + 1
+        hdr = f"  {'SEQ':>6}  {'TIMESTAMP':>19}  {'BYTES':>5}"
+        banner_win.addstr(hdr_row, 0, hdr[:W])
+        banner_win.addstr(hdr_row + 1, 0, ("-" * W)[:W])
+        banner_win.refresh()
+
+    def _make_windows(stdscr):
+        height, width = stdscr.getmaxyx()
+        banner_win = curses.newwin(BANNER_TOTAL_HEIGHT, width, 0, 0)
+        scroll_h   = max(1, height - BANNER_TOTAL_HEIGHT)
+        scroll_win = curses.newwin(scroll_h, width, BANNER_TOTAL_HEIGHT, 0)
+        scroll_win.scrollok(True)
+        scroll_win.idlok(True)
+        return banner_win, scroll_win, width
+
+    banner_win, scroll_win, width = _make_windows(stdscr)
+    _draw_banner(banner_win, width)
+
+    seq = 0
+
+    while running:
+        new_h, new_w = stdscr.getmaxyx()
+        if new_w != width:
+            banner_win, scroll_win, width = _make_windows(stdscr)
+            _draw_banner(banner_win, width)
+
+        seq += 1
+        data = build_payload(seq, sid, local_ip, args.message)
+        sock.sendto(data, (args.group, args.port))
+
+        _log(f"  {seq:>6}  {time.strftime('%Y-%m-%d %H:%M:%S'):>19}"
+             f"  {len(data):>5}")
+
+        time.sleep(args.interval)
+
+    # Final message goes into the log too so it appears on reprint
+    _log(f"\n  Done — {seq} packet(s) sent.")
+    try:
+        scroll_win.refresh()
+        time.sleep(0.5)     # brief pause; no longer need 1.5s — reprint takes over
+    except curses.error:
+        pass
+
+def _run_source_plain(args, sock, local_ip, gi, sid):
+    """Plain-text fallback (original behaviour, used on Windows)."""
+    W = 62
     print("=" * W)
-    print(f"  SOURCE")
-    print(f"  iface  : {args.interface} ({local_ip})  id={sid[:8]}...")
-    print(f"  group  : {args.group}:{args.port}  ttl={args.ttl}  every {args.interval}s")
-    print(f"  scope  : {gi['scope']}")
-    print(f"  type   : {gi['type']}")
-    print(f"  L2 MAC : {gi['mac']}")
-    print(f"  msg    : '{args.message}'")
+    for line in format_banner_lines("source", args, local_ip, gi, sid):
+        print(line)
     print("-" * W)
     print(f"  {'SEQ':>6}  {'TIMESTAMP':>19}  {'B':>5}")
     print("-" * W)
 
     seq, running = 0, True
 
-    def _stop(s, f): nonlocal running; running = False
+    def _stop(s, f):
+        nonlocal running
+        running = False
+
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
 
@@ -367,11 +547,9 @@ def run_source(args):
         print(f"  {seq:>6}  {time.strftime('%Y-%m-%d %H:%M:%S'):>19}  {len(data):>5}")
         time.sleep(args.interval)
 
-    sock.close()
     print("-" * W)
     print(f"  Done — {seq} packet(s) sent.")
     print("=" * W)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-source statistics
@@ -435,7 +613,6 @@ class SourceStats:
 def run_receiver(args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # SO_REUSEPORT: Linux/macOS only — skip silently on Windows
     if hasattr(socket, "SO_REUSEPORT"):
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -452,23 +629,174 @@ def run_receiver(args):
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     sock.settimeout(1.0)
 
+    if HAS_CURSES:
+        log = []
+        curses.wrapper(_run_receiver_curses, args, sock, local_ip, gi, log)
+        _reprint_log(log, "receiver", args, local_ip, gi)
+    else:
+        _run_receiver_plain(args, sock, local_ip, gi)
+
+    sock.close()
+
+def _run_receiver_curses(stdscr, args, sock, local_ip, gi, log):
+    """curses-based receiver loop with persistent banner."""
+    curses.curs_set(0)
+    stdscr.keypad(False)
+
+    running = True
+
+    def _stop(s, f):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT,  _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    def _log(line: str):
+        """Write to scroll window and append to the reprint buffer."""
+        log.append(line)
+        try:
+            scroll_win.addstr(line + "\n")
+            scroll_win.refresh()
+        except curses.error:
+            pass
+
+    def _draw_banner(banner_win, width):
+        banner_win.erase()
+        W = width - 1
+        banner_win.addstr(0, 0, ("=" * W)[:W])
+        content = format_banner_lines("receiver", args, local_ip, gi)
+        for row, text in enumerate(content, start=1):
+            banner_win.addstr(row, 0, text[:W])
+        divider_row = BANNER_CONTENT_HEIGHT + 1
+        banner_win.addstr(divider_row, 0, ("-" * W)[:W])
+        hdr_row = divider_row + 1
+        hdr = (f"  {'#RX':>5}  {'SOURCE':>15}  {'ID':>8}"
+               f"  {'SEQ':>6}  {'LAT(ms)':>8}  STATUS")
+        banner_win.addstr(hdr_row, 0, hdr[:W])
+        banner_win.addstr(hdr_row + 1, 0, ("-" * W)[:W])
+        banner_win.refresh()
+
+    def _make_windows(stdscr):
+        height, width = stdscr.getmaxyx()
+        banner_win = curses.newwin(BANNER_TOTAL_HEIGHT, width, 0, 0)
+        scroll_h   = max(1, height - BANNER_TOTAL_HEIGHT)
+        scroll_win = curses.newwin(scroll_h, width, BANNER_TOTAL_HEIGHT, 0)
+        scroll_win.scrollok(True)
+        scroll_win.idlok(True)
+        return banner_win, scroll_win, width
+
+    banner_win, scroll_win, width = _make_windows(stdscr)
+    _draw_banner(banner_win, width)
+
+    sources   = {}
+    total_rx  = 0
+    total_bad = 0
+
+    while running:
+        new_h, new_w = stdscr.getmaxyx()
+        if new_w != width:
+            banner_win, scroll_win, width = _make_windows(stdscr)
+            _draw_banner(banner_win, width)
+
+        try:
+            data, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        total_rx += 1
+        pkt = parse_payload(data)
+
+        if pkt is None:
+            total_bad += 1
+            _log(f"  {total_rx:>5}  {addr[0]:>15}  {'?':>8}"
+                 f"  {'?':>6}  {'?':>8}  NON-MCAST")
+            continue
+
+        sid    = pkt["sid"]
+        src_ip = pkt.get("src", addr[0])
+        sid8   = sid[:8]
+
+        if sid not in sources:
+            sources[sid] = SourceStats(sid, src_ip, pkt.get("msg", ""))
+            _log(f"")
+            _log(f"  ++ NEW SOURCE  {src_ip}  id={sid8}..."
+                 f"  msg='{pkt.get('msg', '')}'")
+            _log(f"")
+
+        lat, flag = sources[sid].update(pkt["seq"], pkt["t"])
+        status    = flag if flag else "ok"
+        _log(f"  {total_rx:>5}  {src_ip:>15}  {sid8:>8}"
+             f"  {pkt['seq']:>6}  {lat*1000:>8.2f}  {status}")
+
+    _print_summary_curses(scroll_win, args, gi, sources,
+                          total_rx, total_bad, log)
+
+def _print_summary_curses(scroll_win, args, gi, sources,
+                           total_rx, total_bad, log):
+    """Render the post-run summary into the scroll window and log."""
+    W2 = 52
+
+    def _log(line: str):
+        log.append(line)
+        try:
+            scroll_win.addstr(line + "\n")
+        except curses.error:
+            pass
+
+    lines = [
+        "",
+        "=" * W2,
+        f"  SUMMARY   rx={total_rx}  bad={total_bad}  sources={len(sources)}",
+        f"  group={args.group}:{args.port}  scope={gi['scope']}",
+        f"  type={gi['type']}  L2 MAC={gi['mac']}",
+        "-" * W2,
+    ]
+    for i, st in enumerate(sources.values(), 1):
+        s = st.summary()
+        lines += [
+            f"  [{i}] {s['src_ip']}  id={s['sid8']}...  msg='{s['msg']}'",
+            (f"      seq {s['seq']}  rx={s['rx']}  "
+             f"lost={s['lost']} ({s['loss_pct']:.1f}%)  "
+             f"dup={s['dup']}  ooo={s['ooo']}"),
+            (f"      lat  avg={s['lat_avg']:.2f}ms  "
+             f"min={s['lat_min']:.2f}ms  max={s['lat_max']:.2f}ms"),
+        ]
+        if i < len(sources):
+            lines.append("")
+    lines += [
+        "=" * W2,
+        "  * Latency valid only with synchronised clocks (NTP/PTP)",
+        "=" * W2,
+    ]
+
+    for line in lines:
+        _log(line)
+
+    scroll_win.refresh()
+    time.sleep(0.5)     # brief pause before curses tears down
+
+def _run_receiver_plain(args, sock, local_ip, gi):
+    """Plain-text fallback (original behaviour, used on Windows)."""
     W = 68
     print("=" * W)
-    print(f"  RECEIVER")
-    print(f"  iface  : {args.interface} ({local_ip or 'ANY'})")
-    print(f"  group  : {args.group}:{args.port}")
-    print(f"  scope  : {gi['scope']}")
-    print(f"  type   : {gi['type']}")
-    print(f"  L2 MAC : {gi['mac']}")
+    for line in format_banner_lines("receiver", args, local_ip, gi):
+        print(line)
     print("-" * W)
     print(f"  {'#RX':>5}  {'SOURCE':>15}  {'ID':>8}  {'SEQ':>6}  {'LAT(ms)':>8}  STATUS")
     print("-" * W)
 
-    sources = {}
-    total_rx, total_bad = 0, 0
-    running = True
+    sources   = {}
+    total_rx  = 0
+    total_bad = 0
+    running   = True
 
-    def _stop(s, f): nonlocal running; running = False
+    def _stop(s, f):
+        nonlocal running
+        running = False
+
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
 
@@ -485,7 +813,8 @@ def run_receiver(args):
 
         if pkt is None:
             total_bad += 1
-            print(f"  {total_rx:>5}  {addr[0]:>15}  {'?':>8}  {'?':>6}  {'?':>8}  NON-MCAST")
+            print(f"  {total_rx:>5}  {addr[0]:>15}  {'?':>8}"
+                  f"  {'?':>6}  {'?':>8}  NON-MCAST")
             continue
 
         sid    = pkt["sid"]
@@ -494,16 +823,14 @@ def run_receiver(args):
 
         if sid not in sources:
             sources[sid] = SourceStats(sid, src_ip, pkt.get("msg", ""))
-            print(f"\n  ++ NEW SOURCE  {src_ip}  id={sid8}...  msg='{pkt.get('msg','')}'\n")
+            print(f"\n  ++ NEW SOURCE  {src_ip}  id={sid8}..."
+                  f"  msg='{pkt.get('msg','')}'\n")
 
         lat, flag = sources[sid].update(pkt["seq"], pkt["t"])
         status    = flag if flag else "ok"
-        print(f"  {total_rx:>5}  {src_ip:>15}  {sid8:>8}  "
-              f"{pkt['seq']:>6}  {lat*1000:>8.2f}  {status}")
+        print(f"  {total_rx:>5}  {src_ip:>15}  {sid8:>8}"
+              f"  {pkt['seq']:>6}  {lat*1000:>8.2f}  {status}")
 
-    sock.close()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
     W2 = 52
     print("\n" + "=" * W2)
     print(f"  SUMMARY   rx={total_rx}  bad={total_bad}  sources={len(sources)}")
@@ -523,7 +850,6 @@ def run_receiver(args):
     print("=" * W2)
     print("  * Latency valid only with synchronised clocks (NTP/PTP)")
     print("=" * W2)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
